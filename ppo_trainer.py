@@ -12,7 +12,19 @@ import torch.nn.functional as F
 from torch.distributions import Categorical, Bernoulli
 import numpy as np
 from collections import deque
+from scipy import stats
+import matplotlib
 import matplotlib.pyplot as plt
+
+# 配置中文字体
+for _font in ["Microsoft YaHei", "SimHei", "WenQuanYi Micro Hei", "Noto Sans CJK SC"]:
+    try:
+        matplotlib.font_manager.findfont(_font, fallback_to_default=False)
+        plt.rcParams["font.sans-serif"] = [_font, "DejaVu Sans"]
+        plt.rcParams["axes.unicode_minus"] = False
+        break
+    except Exception:
+        continue
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"[PPO] Using device: {device}")
@@ -325,7 +337,9 @@ def plot_metrics(metrics: dict, title: str = "PPO Training"):
     axes[1, 1].grid(True, alpha=0.3)
 
     plt.tight_layout()
-    plt.show()
+    if matplotlib.get_backend() != "agg":
+        plt.show()
+    plt.close()
 
 
 def run_training(
@@ -367,3 +381,254 @@ def run_training(
         trainer.save(save_path)
 
     return metrics
+
+
+# ── 模块4：行为差异验证 ────────────────────────────────────────────
+
+FIELD_W, FIELD_H = 700.0, 500.0
+FIELD_DIAG = np.sqrt(FIELD_W**2 + FIELD_H**2)
+MAX_STEPS = 3600
+
+
+def evaluate_agent(actor, env_class, n_episodes=100, deterministic=True,
+                   reward_weights=None):
+    """
+    评估已训练的 Actor，收集行为指标。
+
+    返回: (summary_dict, raw_metrics_dict)
+      summary 包含 avg_steps, avg_damage_dealt, avg_distances,
+              win_rate, loss_rate, draw_rate 等
+    """
+    env = env_class(render_mode=None, reward_weights=reward_weights)
+    actor.eval()
+
+    raw = {
+        "steps": [], "damage_dealt": [], "damage_taken": [],
+        "wins": 0, "losses": 0, "draws": 0,
+        "distances": [], "attacks": [], "rewards": [],
+    }
+
+    for _ in range(n_episodes):
+        obs = env.reset()
+        done = False
+        ep_steps = 0
+        ep_dmg_d = 0.0
+        ep_dmg_t = 0.0
+        ep_rew = 0.0
+        ep_dist = []
+        ep_atk = 0
+
+        while not done:
+            obs_t = torch.FloatTensor(obs).unsqueeze(0).to(device)
+            with torch.no_grad():
+                move_a, skill_a, _ = actor.get_action(obs_t, deterministic=deterministic)
+
+            move_idx = move_a.item()
+            sk0 = int(skill_a[0, 0].item())
+            sk1 = int(skill_a[0, 1].item())
+
+            obs, reward, done, info = env.step((move_idx, sk0, sk1))
+
+            ep_steps += 1
+            ep_rew += reward
+            ep_dmg_d += info.get("damage_dealt", 0.0)
+            ep_dmg_t += info.get("damage_taken", 0.0)
+            if info.get("player_attack", False):
+                ep_atk += 1
+
+            dist = float(obs[16]) * FIELD_DIAG
+            ep_dist.append(dist)
+
+        winner = info.get("winner", "draw")
+        if winner == "player":
+            raw["wins"] += 1
+        elif winner == "bot":
+            raw["losses"] += 1
+        else:
+            raw["draws"] += 1
+
+        raw["steps"].append(ep_steps)
+        raw["damage_dealt"].append(ep_dmg_d)
+        raw["damage_taken"].append(ep_dmg_t)
+        raw["distances"].append(np.mean(ep_dist))
+        raw["attacks"].append(ep_atk)
+        raw["rewards"].append(ep_rew)
+
+    env.close()
+
+    summary = {"n_episodes": n_episodes}
+    for key in ["steps", "damage_dealt", "damage_taken", "distances", "attacks", "rewards"]:
+        arr = np.array(raw[key])
+        summary[f"avg_{key}"] = float(np.mean(arr))
+        summary[f"std_{key}"] = float(np.std(arr))
+
+    summary["win_rate"] = raw["wins"] / n_episodes
+    summary["loss_rate"] = raw["losses"] / n_episodes
+    summary["draw_rate"] = raw["draws"] / n_episodes
+
+    return summary, raw
+
+
+def compare_agents(aggressive_summary, aggressive_raw,
+                   conservative_summary, conservative_raw,
+                   label_a="激进型", label_b="保守型"):
+    """对比两个智能体的行为指标，包含统计检验和可视化。"""
+
+    metrics_to_compare = [
+        ("steps", "平均存活步数"),
+        ("damage_dealt", "平均每局造成伤害"),
+        ("damage_taken", "平均每局受到伤害"),
+        ("distances", "平均与敌方距离"),
+        ("attacks", "平均每局攻击次数"),
+        ("rewards", "平均每局奖励"),
+    ]
+
+    print(f"\n{'='*60}")
+    print(f"  行为差异验证: {label_a} vs {label_b}")
+    print(f"{'='*60}")
+    print(f"\n{'指标':<18} {label_a:>10} {label_b:>10} {'p-value':>10} {'显著':>6}")
+    print(f"{'-'*18} {'-'*10} {'-'*10} {'-'*10} {'-'*6}")
+
+    p_values = {}
+    for key, name in metrics_to_compare:
+        a_arr = np.array(aggressive_raw[key])
+        b_arr = np.array(conservative_raw[key])
+        t_stat, p_val = stats.ttest_ind(a_arr, b_arr, equal_var=False)
+        p_values[key] = p_val
+        sig = "***" if p_val < 0.001 else "**" if p_val < 0.01 else "*" if p_val < 0.05 else ""
+        print(f"{name:<18} {aggressive_summary[f'avg_{key}']:>10.2f} "
+              f"{conservative_summary[f'avg_{key}']:>10.2f} {p_val:>10.4f} {sig:>6}")
+
+    # Win rate
+    print(f"\n{'胜率':<18} {aggressive_summary['win_rate']:>10.2%} "
+          f"{conservative_summary['win_rate']:>10.2%}")
+    print(f"{'负率':<18} {aggressive_summary['loss_rate']:>10.2%} "
+          f"{conservative_summary['loss_rate']:>10.2%}")
+    print(f"{'平局率':<18} {aggressive_summary['draw_rate']:>10.2%} "
+          f"{conservative_summary['draw_rate']:>10.2%}")
+
+    # Bar chart comparison
+    fig, axes = plt.subplots(2, 3, figsize=(14, 8))
+    fig.suptitle(f"Behavior Comparison: {label_a} vs {label_b}", fontsize=13)
+
+    bar_keys = ["avg_steps", "avg_damage_dealt", "avg_damage_taken",
+                "avg_distances", "avg_attacks", "avg_rewards"]
+    bar_names = ["Survival Steps", "Damage Dealt", "Damage Taken",
+                 "Avg Distance", "Attack Count", "Avg Reward"]
+    bar_stds = ["std_steps", "std_damage_dealt", "std_damage_taken",
+                "std_distances", "std_attacks", "std_rewards"]
+
+    for ax, key, name, skey in zip(axes.flat, bar_keys, bar_names, bar_stds):
+        vals = [aggressive_summary[key], conservative_summary[key]]
+        errs = [aggressive_summary[skey], conservative_summary[skey]]
+        bars = ax.bar([label_a, label_b], vals, yerr=errs, capsize=8,
+                      color=["#FF6B6B", "#6BB5FF"], edgecolor="white")
+        ax.set_title(name)
+        ax.grid(axis="y", alpha=0.3)
+        sig_key = key.replace("avg_", "")
+        if sig_key in p_values and p_values[sig_key] < 0.05:
+            ax.text(0.5, 0.95, f"p={p_values[sig_key]:.3f} *",
+                    transform=ax.transAxes, ha="center", fontsize=10, color="red")
+
+    plt.tight_layout()
+    if matplotlib.get_backend() != "agg":
+        plt.show()
+    plt.close()
+
+    return p_values
+
+
+def load_actor_for_eval(path, hidden_dim=128):
+    """从检查点加载 Actor 用于评估。"""
+    actor = Actor(obs_dim=24, hidden_dim=hidden_dim)
+    ckpt = torch.load(path, map_location=device)
+    actor.load_state_dict(ckpt["actor"])
+    actor.to(device)
+    actor.eval()
+    return actor
+
+
+def run_behavior_experiment(env_class, total_steps=100_000, hidden_dim=128,
+                            eval_episodes=100):
+    """
+    完整行为差异验证实验：
+    1. 训练激进型模型
+    2. 训练保守型模型
+    3. 评估 + 对比
+    """
+    aggressive_weights = {
+        "damage_dealt": 2.0,
+        "damage_taken": -0.1,
+        "survival_bonus": 0.0,
+        "distance_penalty": 0.0,
+        "kill_bonus": 10.0,
+    }
+    conservative_weights = {
+        "damage_dealt": 0.5,
+        "damage_taken": -5.0,
+        "survival_bonus": 1.0,
+        "distance_penalty": -0.5,
+        "kill_bonus": 2.0,
+    }
+
+    print("=" * 60)
+    print("  Module 4: Behavior Differentiation Experiment")
+    print("=" * 60)
+
+    # ── 训练激进型 ──
+    print("\n[Phase 1] Training aggressive agent...")
+    env_agg = env_class(render_mode=None)
+    agg_metrics = run_training(
+        env_agg, total_steps=total_steps, hidden_dim=hidden_dim,
+        reward_weights=aggressive_weights, save_path="model_aggressive.pth",
+    )
+    env_agg.close()
+    print("Aggressive agent training complete.\n")
+
+    # ── 训练保守型 ──
+    print("\n[Phase 2] Training conservative agent...")
+    env_con = env_class(render_mode=None)
+    con_metrics = run_training(
+        env_con, total_steps=total_steps, hidden_dim=hidden_dim,
+        reward_weights=conservative_weights, save_path="model_conservative.pth",
+    )
+    env_con.close()
+    print("Conservative agent training complete.\n")
+
+    # ── 评估 ──
+    print("\n[Phase 3] Evaluating both agents...")
+    actor_agg = load_actor_for_eval("model_aggressive.pth", hidden_dim)
+    actor_con = load_actor_for_eval("model_conservative.pth", hidden_dim)
+
+    agg_summary, agg_raw = evaluate_agent(
+        actor_agg, env_class, n_episodes=eval_episodes,
+        reward_weights=aggressive_weights,
+    )
+    con_summary, con_raw = evaluate_agent(
+        actor_con, env_class, n_episodes=eval_episodes,
+        reward_weights=conservative_weights,
+    )
+
+    # ── 对比 ──
+    p_vals = compare_agents(agg_summary, agg_raw, con_summary, con_raw)
+
+    # ── 训练曲线对比 ──
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+    axes[0].plot(agg_metrics["reward"], label="Aggressive", color="#FF6B6B")
+    axes[0].plot(con_metrics["reward"], label="Conservative", color="#6BB5FF")
+    axes[0].set_title("Training Reward Curves")
+    axes[0].set_xlabel("Iteration"); axes[0].set_ylabel("Avg Reward")
+    axes[0].legend(); axes[0].grid(True, alpha=0.3)
+
+    axes[1].plot(agg_metrics["entropy"], label="Aggressive", color="#FF6B6B")
+    axes[1].plot(con_metrics["entropy"], label="Conservative", color="#6BB5FF")
+    axes[1].set_title("Entropy Curves")
+    axes[1].set_xlabel("Iteration"); axes[1].set_ylabel("Entropy")
+    axes[1].legend(); axes[1].grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    if matplotlib.get_backend() != "agg":
+        plt.show()
+    plt.close()
+
+    return agg_summary, con_summary, p_vals
